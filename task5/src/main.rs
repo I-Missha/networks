@@ -1,27 +1,33 @@
 use polling::{Event, Events, Poller};
+use socket2::SockAddr;
 
 use std::{
+    fmt::write,
+    hash::Hash,
     io::{Read, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     time::Duration,
 };
-#[derive(PartialEq, Clone)]
+
+#[derive(PartialEq, Clone, Debug)]
 pub enum ClientState {
     WaitingForReceiveHandshake,
     WaitForAnswerToHandshake,
     WaitingForRequest,
     WaitingForRemoteServerConnection,
-    WaitingForConnection,
     WaitingForSendingConnectionStatus,
     Connected,
     StateNone,
 }
 
+#[derive(Debug)]
 pub struct Connection {
     key: usize,
     socket: TcpStream,
     dest: Option<usize>,
     state: ClientState,
+    is_ready_to_send: bool,
+    buffer_to_send: Vec<u8>,
 }
 
 impl Connection {
@@ -40,7 +46,7 @@ impl Connection {
         let _bytes_number = self.socket.write(&buff);
         let _ = poller.modify(&self.socket, Event::readable(self.key));
     }
-    pub fn handle_request(&mut self) -> TcpStream {
+    pub fn handle_request(&mut self) -> Option<TcpStream> {
         let mut buff = [0; 256];
         let _bytes_number = self.socket.read(&mut buff).unwrap();
         self.state = ClientState::StateNone;
@@ -71,14 +77,49 @@ impl Connection {
                 let addrv4 = SocketAddr::new(addrv4, port);
                 addrv4
             }
-            _ => panic!("cant define type of addr"),
+            4 => {
+                return None;
+            }
+            _ => return None,
         };
         dbg!(addr);
-        let remote_server_socket =
-            TcpStream::connect_timeout(&addr, Duration::new(0, 100000000)).unwrap();
-        remote_server_socket
+        let remote_server_socket = TcpStream::connect_timeout(&addr, Duration::new(2, 0)).unwrap();
+        let _ = remote_server_socket.set_nonblocking(true);
+        Some(remote_server_socket)
     }
-    pub fn send_ans_connected_state(&self) {}
+
+    pub fn get_response(&mut self) -> Vec<u8> {
+        let mut buff = [0; 300];
+        let bytes_number = self.socket.read(&mut buff).unwrap();
+        dbg!(&buff[0..bytes_number]);
+        Vec::from(&buff[0..bytes_number])
+    }
+}
+
+fn get_dest_state(connections: &Vec<Connection>, key: usize) -> Option<ClientState> {
+    let connection: &Connection = connections.get(key).unwrap();
+    let dest_key = connection.dest;
+    let dest_connection = match dest_key {
+        Some(key_tmp) => connections.get(key_tmp),
+        None => None,
+    };
+    match dest_connection {
+        Some(connection) => Some(connection.state.clone()),
+        None => None,
+    }
+}
+
+fn get_dest_addr(connections: &Vec<Connection>, key: usize) -> Option<SocketAddr> {
+    let connection: &Connection = &connections.get(key).unwrap();
+    let dest_key = connection.dest;
+    let dest_connection = match dest_key {
+        Some(key_tmp) => connections.get(key_tmp),
+        None => None,
+    };
+    match dest_connection {
+        Some(connection) => Some(connection.socket.local_addr().unwrap()),
+        None => None,
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -116,12 +157,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     dest: None,
                     socket: (socket),
                     state: ClientState::WaitingForReceiveHandshake,
+                    is_ready_to_send: false,
+                    buffer_to_send: Vec::new(),
                 });
                 keys_counter += 1;
+                let _ = poller.modify(&server_sock, Event::readable(key));
                 continue;
             }
             // read data and depending on the state do something
-            let connection: &mut Connection = connections.get(event.key).unwrap();
+            let connection: &Connection = connections.get(event.key).unwrap();
+            let dest_key = connection.dest;
+            let dest_addr = get_dest_addr(&connections, event.key);
+            let connection: &mut Connection = connections.get_mut(event.key).unwrap();
             match connection.state {
                 ClientState::WaitingForReceiveHandshake => {
                     connection.handle_handshake(&poller);
@@ -130,27 +177,86 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     connection.answer_to_handshake(&poller);
                 }
                 ClientState::WaitingForRequest => {
-                    let remote_server_socket = connection.handle_request();
+                    let remote_server_socket = match connection.handle_request() {
+                        Some(socket) => socket,
+                        None => {
+                            poller.delete(&connection.socket);
+                            continue;
+                        }
+                    };
                     let client_key = connection.key;
                     unsafe {
                         let _ = poller.add(&remote_server_socket, Event::readable(keys_counter));
                     }
                     connection.dest = Some(keys_counter);
-                    connection.state = ClientState::WaitingForRemoteServerConnection;
+                    connection.state = ClientState::WaitingForSendingConnectionStatus;
                     let _ = poller.modify(&connection.socket, Event::writable(connection.key));
+                    unsafe {
+                        let _ = poller.add(&remote_server_socket, Event::writable(keys_counter));
+                    }
                     connections.push(Connection {
                         key: keys_counter,
                         socket: remote_server_socket,
                         dest: Some(client_key),
-                        state: ClientState::WaitingForConnection,
+                        state: ClientState::Connected,
+                        is_ready_to_send: false,
+                        buffer_to_send: Vec::new(),
                     });
                     keys_counter += 1;
                 }
-                ClientState::WaitingForConnection => {}
-                ClientState::WaitingForRemoteServerConnection => {
-                    let save_key = connection.dest.unwrap();
-                    let dest_state = connections.get(save_key).unwrap().state.clone();
-                    connection.state = ClientState::WaitingForSendingConnectionStatus;
+                ClientState::WaitingForSendingConnectionStatus => {
+                    let dest_ip = match connection.socket.local_addr().unwrap().ip() {
+                        IpAddr::V4(ip) => ip.octets(),
+                        IpAddr::V6(_) => panic!("how i got ipv6"),
+                    };
+                    let dest_port = connection.socket.local_addr().unwrap().port().to_le_bytes();
+                    dbg!(dest_addr);
+                    let mut data_to_send: [u8; 10] = [0; 10];
+                    data_to_send[0] = 5;
+                    data_to_send[1] = 0;
+                    data_to_send[2] = 0;
+                    data_to_send[3] = 1;
+
+                    data_to_send[4] = dest_ip[0];
+                    data_to_send[5] = dest_ip[1];
+                    data_to_send[6] = dest_ip[2];
+                    data_to_send[7] = dest_ip[3];
+
+                    data_to_send[8] = dest_port[0];
+                    data_to_send[9] = dest_port[1];
+                    let _bytes_number = connection.socket.write(&data_to_send);
+                    let _ = poller.modify(&connection.socket, Event::readable(connection.key));
+                    connection.state = ClientState::Connected;
+                }
+                ClientState::Connected => {
+                    if event.readable {
+                        let mut buff = [0; 1024];
+                        let bytes_number = connection.socket.read(&mut buff)?;
+                        let _ = poller.modify(&connection.socket, Event::readable(connection.key));
+                        connections
+                            .get_mut(dest_key.unwrap())
+                            .unwrap()
+                            .is_ready_to_send = true;
+                        connections
+                            .get_mut(dest_key.unwrap())
+                            .unwrap()
+                            .buffer_to_send = Vec::from(&buff[0..bytes_number]);
+                        let bytes = connections
+                            .get_mut(dest_key.unwrap())
+                            .unwrap()
+                            .socket
+                            .write(&buff[0..bytes_number]);
+                        /*println!(
+                            "source key is: {}\nand dest key is: {}\n bytes number: {}",
+                            event.key,
+                            dest_key.unwrap(),
+                            bytes?
+                        );*/
+                    } /*else if event.writable && connection.is_ready_to_send {
+                          let _bytes_number = connection.socket.write(&connection.buffer_to_send);
+                          connection.is_ready_to_send = false;
+                          let _ = poller.modify(&connection.socket, Event::all(connection.key));
+                      }*/
                 }
                 _ => continue,
             }
